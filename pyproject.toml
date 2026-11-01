@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-change-context"
+version = "0.1.0"
+description = "Correlate AWS security-sensitive changes with GitHub pull requests and deployments."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Cloud Change Context contributors" }]
+keywords = ["aws", "cloudtrail", "github", "security", "audit", "change-management"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+]
+dependencies = ["boto3>=1.34"]
+
+[project.scripts]
+ccx = "cloud_change_context.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+license-files = ["LICENSE"]
