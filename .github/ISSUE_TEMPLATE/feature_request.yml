@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a focused improvement
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What task is difficult or missing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful change.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security or permission impact
+      description: Would this require new cloud/GitHub permissions or change read-only behavior?
+    validations:
+      required: false

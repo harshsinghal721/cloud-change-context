@@ -1,10 +1,13 @@
 # Cloud Change Context
 
+[![Tests](https://github.com/harshsinghal721/cloud-change-context/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/harshsinghal721/cloud-change-context/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Correlate AWS security-sensitive changes with GitHub pull requests and CI/CD deployments.
 
-Cloud Change Context answers one question for every tracked CloudTrail event:
+Cloud Change Context helps answer one question for every tracked CloudTrail event:
 
-> What changed, who changed it, and what approved PR or deployment matches that change?
+> What changed, who changed it, and what PR or successful deployment provides evidence for that change?
 
 It is **read-only**. It never approves, modifies, or remediates cloud resources.
 
