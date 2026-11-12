@@ -1,5 +1,6 @@
 import json
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from cloud_change_context.models import Change, ChangeMatch, Evidence, MatchedEvidence
@@ -79,6 +80,17 @@ class ReportTests(unittest.TestCase):
         self.assertIn("[MATCHED]", output)
         self.assertIn("Evidence:", output)
         self.assertIn("Approval granted: no", output)
+
+    def test_text_report_strips_control_characters_from_every_field(self):
+        match = make_match()
+        change = replace(match.change, event_id="id\x1b[31m-1")
+        item = match.evidence[0]
+        evidence = replace(item.evidence, url="https://github.com/acme/repo/pull/1\x07")
+        match = replace(match, change=change, evidence=(replace(item, evidence=evidence),))
+        output = render([match], META, "text")
+        self.assertNotIn("\x1b", output)
+        self.assertNotIn("\x07", output)
+        self.assertIn("(id [31m-1)", output)
 
 
 if __name__ == "__main__":

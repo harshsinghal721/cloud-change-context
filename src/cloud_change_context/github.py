@@ -5,17 +5,46 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from . import __version__
 from .models import Evidence
 
 BASE_URL = "https://api.github.com"
+PAGE_SIZE = 100
 _REPO_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+$")
+_TERMINAL_STATES = frozenset({"success", "failure", "error", "inactive"})
 
 
 class GitHubError(Exception):
     """A safe, user-facing GitHub API error. Never includes the token."""
+
+
+class GitHubRateLimitError(GitHubError):
+    """The GitHub API rate limit was hit; further calls would fail the same way."""
+
+
+class GitHubAuthError(GitHubError):
+    """GitHub rejected the token; further calls would fail the same way."""
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """Follow redirects only over HTTPS and never send the token to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlparse(newurl)
+        if target.scheme != "https":
+            return None
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and target.hostname != urlparse(req.full_url).hostname:
+            for store in (new.headers, new.unredirected_hdrs):
+                for name in [key for key in store if key.lower() == "authorization"]:
+                    del store[name]
+        return new
+
+
+_OPENER = build_opener(_SafeRedirectHandler)
 
 
 def validate_repo(repo: str) -> None:
@@ -35,20 +64,28 @@ def fetch_pull_requests(
     end: datetime,
     tolerance_minutes: int,
     max_pages: int = 5,
+    notes: list[str] | None = None,
 ) -> list[Evidence]:
-    """Fetch merged pull requests near the window. Read-only GET requests."""
+    """Fetch merged pull requests near the window. Read-only GET requests.
+
+    Anything that makes the result incomplete is appended to ``notes`` (if given) so the
+    caller can surface it; the return value stays a plain list.
+    """
     validate_repo(repo)
+    notes = notes if notes is not None else []
     earliest = start - timedelta(minutes=tolerance_minutes)
     latest = end + timedelta(minutes=tolerance_minutes)
     found: dict[int, Evidence] = {}
+    exhausted = True
 
     for page in range(1, max_pages + 1):
         data = _api(
             f"/repos/{repo}/pulls?state=closed&sort=updated&direction=desc"
-            f"&per_page=100&page={page}",
+            f"&per_page={PAGE_SIZE}&page={page}",
             token,
         )
         if not isinstance(data, list) or not data:
+            exhausted = False
             break
 
         oldest_update: datetime | None = None
@@ -64,9 +101,16 @@ def fetch_pull_requests(
             if merged and earliest <= merged <= latest and isinstance(number, int):
                 found.setdefault(number, _pull_request_evidence(item, merged))
 
-        if oldest_update and oldest_update < earliest:
+        if (oldest_update and oldest_update < earliest) or len(data) < PAGE_SIZE:
+            exhausted = False
             break
 
+    if exhausted:
+        notes.append(
+            f"Pull request listing stopped after {max_pages} pages "
+            f"({max_pages * PAGE_SIZE} items); older merged PRs in the window may be "
+            "missing. Use a narrower window."
+        )
     return list(found.values())
 
 
@@ -77,17 +121,29 @@ def fetch_deployments(
     end: datetime,
     tolerance_minutes: int,
     max_pages: int = 5,
+    detail_limit: int | None = None,
+    notes: list[str] | None = None,
 ) -> list[Evidence]:
-    """Fetch deployments near the window plus their latest status and commit message."""
+    """Fetch deployments near the window plus their latest status and commit message.
+
+    Status and commit details cost extra requests, so only ``detail_limit`` deployments
+    (those closest to the window first) get them; the rest keep an ``unknown`` state and
+    can only ever be "uncertain". Every shortfall is appended to ``notes``.
+    """
     validate_repo(repo)
+    notes = notes if notes is not None else []
     earliest = start - timedelta(minutes=tolerance_minutes)
     latest = end + timedelta(minutes=tolerance_minutes)
-    candidates: list[dict[str, Any]] = []
+    candidates: list[tuple[datetime, dict[str, Any]]] = []
     seen: set[int] = set()
+    exhausted = True
 
     for page in range(1, max_pages + 1):
-        data = _api(f"/repos/{repo}/deployments?per_page=100&page={page}", token)
+        data = _api(
+            f"/repos/{repo}/deployments?per_page={PAGE_SIZE}&page={page}", token
+        )
         if not isinstance(data, list) or not data:
+            exhausted = False
             break
 
         oldest_created: datetime | None = None
@@ -106,43 +162,66 @@ def fetch_deployments(
                 and deployment_id not in seen
             ):
                 seen.add(deployment_id)
-                candidates.append(item)
+                candidates.append((created, item))
 
-        if oldest_created and oldest_created < earliest:
+        if (oldest_created and oldest_created < earliest) or len(data) < PAGE_SIZE:
+            exhausted = False
             break
 
-    detail_limit = 20 if token else 5
+    if exhausted:
+        notes.append(
+            f"Deployment listing stopped after {max_pages} pages "
+            f"({max_pages * PAGE_SIZE} items); older deployments in the window may be "
+            "missing. Use a narrower window."
+        )
+
+    # Spend the limited detail requests on the deployments closest to the window.
+    candidates.sort(key=lambda pair: _outside_window(pair[0], start, end))
+    limit = detail_limit if detail_limit is not None else (20 if token else 5)
+
     commit_cache: dict[str, str] = {}
-    status_enabled = True
-    commit_enabled = True
+    blocked = False
+    status_failures = 0
+    commit_failures = 0
     evidence: list[Evidence] = []
 
-    for index, item in enumerate(candidates):
+    for index, (created, item) in enumerate(candidates):
         deployment_id = item["id"]
-        created = _parse_iso(item.get("created_at"))
-        if not created:
-            continue
+        in_detail_range = index < limit
 
         state = "unknown"
-        commit_message = ""
-        if index < detail_limit and status_enabled:
+        finished: datetime | None = None
+        if in_detail_range and not blocked:
             try:
                 states = _api(f"/repos/{repo}/deployments/{deployment_id}/statuses", token)
                 if isinstance(states, list) and states and isinstance(states[0], dict):
-                    state = str(states[0].get("state") or "unknown")
+                    latest_status = states[0]
+                    state = str(latest_status.get("state") or "unknown")
+                    if state in _TERMINAL_STATES:
+                        done = _parse_iso(latest_status.get("created_at"))
+                        if done and done > created:
+                            finished = done
+            except (GitHubRateLimitError, GitHubAuthError) as exc:
+                blocked = True
+                notes.append(f"Deployment details stopped early: {exc}")
             except GitHubError:
-                status_enabled = False
+                status_failures += 1
 
+        commit_message = ""
         sha = str(item.get("sha") or "")
-        if index < detail_limit and commit_enabled and sha:
+        if in_detail_range and not blocked and sha:
             if sha not in commit_cache:
                 try:
                     commit = _api(f"/repos/{repo}/commits/{quote(sha, safe='')}", token)
                     message = _dict(_dict(commit).get("commit")).get("message")
                     commit_cache[sha] = str(message or "")[:5000]
+                except (GitHubRateLimitError, GitHubAuthError) as exc:
+                    blocked = True
+                    commit_cache[sha] = ""
+                    notes.append(f"Deployment details stopped early: {exc}")
                 except GitHubError:
                     commit_cache[sha] = ""
-                    commit_enabled = False
+                    commit_failures += 1
             commit_message = commit_cache[sha]
 
         ref = str(item.get("ref") or "")
@@ -165,10 +244,36 @@ def fetch_deployments(
                 state=state,
                 text=text,
                 detail=environment or "unknown environment",
+                finished=finished,
             )
         )
 
+    skipped = len(candidates) - limit
+    if skipped > 0 and not blocked:
+        hint = "" if token else " Set GITHUB_TOKEN to raise the limit."
+        notes.append(
+            f"Status and commit message were read for only {limit} of {len(candidates)} "
+            f"deployments; the other {skipped} have an unknown status and can only be "
+            f"'uncertain'.{hint}"
+        )
+    if status_failures:
+        notes.append(
+            f"Could not read the status of {status_failures} deployment(s); "
+            "they stay 'unknown'."
+        )
+    if commit_failures:
+        notes.append(
+            f"Could not read the commit message for {commit_failures} deployment(s)."
+        )
     return evidence
+
+
+def _outside_window(when: datetime, start: datetime, end: datetime) -> float:
+    if when < start:
+        return (start - when).total_seconds()
+    if when > end:
+        return (when - end).total_seconds()
+    return 0.0
 
 
 def _pull_request_evidence(item: dict[str, Any], merged: datetime) -> Evidence:
@@ -196,14 +301,14 @@ def _api(path: str, token: str | None) -> Any:
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "cloud-change-context/0.1.0",
+        "User-Agent": f"cloud-change-context/{__version__}",
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
     request = Request(f"{BASE_URL}{path}", headers=headers, method="GET")
     try:
-        with urlopen(request, timeout=30) as response:
+        with _OPENER.open(request, timeout=30) as response:
             body = response.read().decode("utf-8")
     except HTTPError as exc:
         message = ""
@@ -215,9 +320,13 @@ def _api(path: str, token: str | None) -> Any:
             pass
         remaining = exc.headers.get("X-RateLimit-Remaining") if exc.headers else None
         if exc.code == 401:
-            raise GitHubError("GitHub rejected the token (401). Check GITHUB_TOKEN.") from None
-        if exc.code == 403 and remaining == "0":
-            raise GitHubError(
+            raise GitHubAuthError(
+                "GitHub rejected the token (401). Check GITHUB_TOKEN."
+            ) from None
+        if exc.code in (403, 429) and (
+            remaining == "0" or "rate limit" in message.lower()
+        ):
+            raise GitHubRateLimitError(
                 "GitHub API rate limit exceeded. Set GITHUB_TOKEN or wait for the limit to reset."
             ) from None
         if exc.code == 404:

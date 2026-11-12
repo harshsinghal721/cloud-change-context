@@ -18,6 +18,8 @@ The tool only needs `cloudtrail:LookupEvents`. `LookupEvents` does not support r
 }
 ```
 
+Events are looked up one event name at a time, so a run makes 22 `LookupEvents` calls for IAM plus 16 per region, plus pagination. CloudTrail rate-limits this API per region; the AWS SDK retries throttled calls with backoff.
+
 No S3, EC2, IAM, or write actions are used. The tool does not call `DescribeSecurityGroups`; security group IDs and names come from the CloudTrail event itself.
 
 Use the standard credential chain:

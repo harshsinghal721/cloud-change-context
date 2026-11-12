@@ -16,6 +16,7 @@ Include the affected version, a minimal reproduction, and the impact. Do not inc
 
 - **Read-only cloud access.** The only AWS API call is `cloudtrail:LookupEvents`. GitHub access is GET-only over HTTPS.
 - **No automatic approval.** A matched change is correlated evidence, not an approval. The tool cannot approve or remediate anything.
+- **Token stays with GitHub.** Redirects are followed only over HTTPS, and the `Authorization` header is removed if a redirect points to a different host.
 - **No credential persistence.** AWS credentials use the standard credential chain. `GITHUB_TOKEN`/`GH_TOKEN` is read from the environment. Neither is written to disk or printed.
 - **No raw request bodies in reports.** CloudTrail policy documents and other request payloads are not retained in the report model.
 - **Fail-closed matching.** Failed or unknown deployments, ambiguous candidates, and missing evidence never produce `matched`.
