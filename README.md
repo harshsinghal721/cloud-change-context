@@ -69,7 +69,11 @@ ccx report --region us-east-1 --repo owner/name \
   --start 2026-10-30T00:00:00Z --end 2026-10-31T00:00:00Z
 ```
 
-Default window is the last 24 hours. IAM is global, so IAM events are read from `us-east-1`; S3 and EC2 events come from `--region`.
+Default window is the last 24 hours. IAM is global, so IAM events are read from one fixed region per partition (`us-east-1`, or `cn-north-1` / `us-gov-west-1` for China / GovCloud regions); S3 and EC2 events come from each `--region`. Repeat the flag to cover several regions:
+
+```bash
+ccx report --region us-east-1 --region eu-west-1 --repo owner/name
+```
 
 Markdown or JSON output:
 
@@ -83,13 +87,14 @@ Useful options:
 | Option | Meaning |
 | --- | --- |
 | `--start`, `--end` | ISO 8601 UTC window. CloudTrail supports at most 90 days per query. |
-| `--region` | Region for S3 and EC2 events. Defaults to `AWS_REGION`, `AWS_DEFAULT_REGION`, or `us-east-1`. |
+| `--region` | Region for S3 and EC2 events; repeatable. Defaults to `AWS_REGION`, `AWS_DEFAULT_REGION`, or `us-east-1`. |
 | `--profile` | Named AWS profile from the standard credential chain. |
-| `--repo` | GitHub `owner/name`. Without it, every change is `unmatched`. |
+| `--repo` | GitHub `owner/name`. Without it, every change is `unmatched` and the reason says GitHub was not queried. |
 | `--tolerance-minutes` | Maximum time distance for evidence. Default `90`. |
 | `--actor-map` | Map a GitHub login to a CloudTrail identity. Repeatable. |
 | `--format` | `text`, `markdown`, or `json`. |
 | `--max-events` | Safety cap on tracked CloudTrail events. Default `2000`. |
+| `--max-deployment-details` | How many deployments get a status and commit-message lookup (closest to the window first). Default `20` with a token, `5` without. |
 
 ### Actor mapping
 
@@ -107,7 +112,7 @@ The order is `github_login=cloudtrail_identity`; either side can be the value us
 | --- | --- |
 | `matched` | Exactly one nearby candidate has actor, resource, and a merged PR or successful deployment. |
 | `uncertain` | Evidence exists, but a signal is missing or multiple candidates are equally strong. Human review required. |
-| `unmatched` | No PR or deployment was found inside the tolerance window. |
+| `unmatched` | No PR or deployment was found inside the tolerance window. If GitHub was not queried (`--repo` missing) or a source could not be retrieved, the reason says so instead of claiming nothing exists. |
 
 **`matched` is not approval.** A matched change only has correlated evidence. The tool always reports `Approval granted: no` and `approved: false` in JSON. A missing or failed match is never treated as approved.
 
@@ -137,17 +142,21 @@ Resource names and actor identities in a report are still sensitive operational 
 ## Limitations
 
 - CloudTrail `LookupEvents` covers management events, not data-plane events, only the last 90 days, and recent events may take a few minutes to appear.
-- One AWS region per run, plus global IAM events from `us-east-1`.
-- GitHub PR/deployment listing is capped at 5 pages (500 items each). Use a narrower window for very busy repositories.
-- Correlation is heuristic. Actor names, resource names, and commit/PR text must contain usable identifiers. Aliases may be required.
+- Only the regions you pass with `--region` are read (plus global IAM events); there is no all-regions mode because listing regions would need an extra permission.
+- Events are looked up by event name (22 `LookupEvents` calls for IAM plus 16 per region, plus pagination), which skips read-only noise but is subject to CloudTrail's per-region lookup rate limit (the AWS SDK retries with backoff).
+- GitHub PR/deployment listing is capped at 5 pages (500 items each); the report warns when the cap is hit. Use a narrower window for very busy repositories.
+- Only a limited number of deployments get a status and commit lookup (see `--max-deployment-details`); the rest stay `unknown` and can only be `uncertain`. The report says how many.
+- Correlation is heuristic. Actor names, resource names, and commit/PR text must contain usable identifiers. Aliases may be required. A resource whose name is only generic words (`app`, `prod-api`, `logs`) is recorded but never counts as a resource match.
+- Security-group rule details for `ModifySecurityGroupRules` and group-to-group sources are parsed loosely from CloudTrail's request bodies; if a layout differs, the summary is shorter, not wrong.
 - Security group changes reported by name only are not resolved to a group ID (that would need extra EC2 permissions).
 - A merged PR or successful deployment is evidence of process, not proof that the deployed state matches the intended change.
 
 ## Development
 
 ```bash
-pip install -e .
+pip install -e ".[dev]"
 python -m unittest discover -s tests -v
+mypy
 ```
 
 Project layout:

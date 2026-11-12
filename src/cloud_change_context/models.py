@@ -38,6 +38,9 @@ class Evidence:
     state: str
     text: str = ""
     detail: str = ""
+    # When a deployment reached a terminal status, the time of that status. A change
+    # made by a long pipeline lands near the end of it, not near its creation.
+    finished: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,9 @@ class MatchedEvidence:
     actor_match: bool
     resource_match: bool
     delta_minutes: int
+    # True when the only resource hit was a generic name such as "app" or "prod-api".
+    # Such a hit is recorded but never counts as a resource match.
+    resource_generic: bool = False
 
     @property
     def state_ok(self) -> bool:
@@ -64,6 +70,8 @@ class MatchedEvidence:
             signals.append("actor")
         if self.resource_match:
             signals.append("resource")
+        elif self.resource_generic:
+            signals.append("generic resource name")
         if self.evidence.kind == "deployment":
             signals.append(f"deployment {self.evidence.state or 'unknown'}")
         return tuple(signals)

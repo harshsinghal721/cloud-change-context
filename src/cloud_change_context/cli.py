@@ -52,8 +52,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument(
         "--region",
-        default=default_region,
-        help=f"AWS region for S3/EC2 events (default: {default_region})",
+        action="append",
+        default=None,
+        metavar="REGION",
+        help=(
+            "AWS region for S3/EC2 events; repeat to read several regions "
+            f"(default: {default_region})"
+        ),
     )
     report.add_argument(
         "--profile", help="AWS profile name from the standard credential chain"
@@ -84,6 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=2000,
         help="safety cap on tracked CloudTrail events (default: 2000)",
     )
+    report.add_argument(
+        "--max-deployment-details",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "how many deployments get a status/commit lookup "
+            "(default: 20 with a token, 5 without)"
+        ),
+    )
     return parser
 
 
@@ -102,6 +117,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--tolerance-minutes must be between 1 and 1440")
     if args.max_events < 1:
         parser.error("--max-events must be at least 1")
+    if args.max_deployment_details is not None and args.max_deployment_details < 0:
+        parser.error("--max-deployment-details must not be negative")
+
+    default_region = (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "us-east-1"
+    )
+    regions = list(dict.fromkeys(r.strip() for r in (args.region or []) if r.strip()))
+    if not regions:
+        regions = [default_region]
 
     try:
         actor_pairs = parse_actor_pairs(args.actor_map)
@@ -120,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         changes, aws_warnings = fetch_changes(
             start=start,
             end=end,
-            region=args.region,
+            region=regions,
             profile=args.profile,
             max_events=args.max_events,
         )
@@ -130,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     warnings.extend(aws_warnings)
 
     evidence = []
+    unavailable: list[str] = []
     if repo:
         token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
         if not token:
@@ -145,9 +172,11 @@ def main(argv: list[str] | None = None) -> int:
                     start,
                     end,
                     args.tolerance_minutes,
+                    notes=warnings,
                 )
             )
         except GitHubError as exc:
+            unavailable.append("pull request")
             warnings.append(f"Pull request evidence unavailable: {exc}")
         try:
             evidence.extend(
@@ -157,9 +186,12 @@ def main(argv: list[str] | None = None) -> int:
                     start,
                     end,
                     args.tolerance_minutes,
+                    detail_limit=args.max_deployment_details,
+                    notes=warnings,
                 )
             )
         except GitHubError as exc:
+            unavailable.append("deployment")
             warnings.append(f"Deployment evidence unavailable: {exc}")
     else:
         warnings.append("No --repo given; GitHub evidence was not queried.")
@@ -169,12 +201,14 @@ def main(argv: list[str] | None = None) -> int:
         evidence,
         tolerance_minutes=args.tolerance_minutes,
         actor_pairs=actor_pairs,
+        evidence_checked=bool(repo),
+        unavailable_sources=unavailable,
     )
     meta = ReportMeta(
         start=start,
         end=end,
         generated_at=datetime.now(timezone.utc),
-        region=args.region,
+        region=", ".join(regions),
         repo=repo,
         tolerance_minutes=args.tolerance_minutes,
         warnings=tuple(warnings),

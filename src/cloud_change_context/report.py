@@ -52,7 +52,7 @@ def _render_text(matches: list[ChangeMatch], meta: ReportMeta) -> str:
         lines.append(f"   Change: {clean_text(change.summary)}")
         lines.append(f"   Actor:  {clean_text(change.actor)}")
         lines.append(
-            f"   Event:  {change.event_name} ({change.event_id})"
+            f"   Event:  {clean_text(change.event_name)} ({clean_text(change.event_id)})"
         )
         lines.append(f"   Match:  {clean_text('; '.join(match.reasons))}")
         if match.evidence:
@@ -207,7 +207,7 @@ def _evidence_text(item: MatchedEvidence) -> str:
     if evidence.kind == "deployment" and evidence.detail:
         details.append(clean_text(evidence.detail))
     label = f"{evidence.ref}{title} ({', '.join(details)}; {item.delta_minutes} min)"
-    return f"{label} -> {evidence.url}" if evidence.url else label
+    return f"{label} -> {clean_text(evidence.url)}" if evidence.url else label
 
 
 def _evidence_md(item: MatchedEvidence) -> str:

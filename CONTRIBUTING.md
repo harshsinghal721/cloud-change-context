@@ -16,8 +16,9 @@ Requires Python 3.10 or newer.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
 python -m unittest discover -s tests -v
+mypy
 ```
 
 On Windows PowerShell, activate the environment with `\.venv\Scripts\Activate.ps1`.

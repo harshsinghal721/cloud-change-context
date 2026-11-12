@@ -17,10 +17,10 @@ A candidate is any PR or deployment within `± tolerance_minutes` of the change 
 ### Time
 
 ```
-|evidence_time - change_time| <= tolerance
+distance(evidence, change_time) <= tolerance
 ```
 
-The default tolerance is 90 minutes. PR time is `merged_at`; deployment time is `created_at`.
+The default tolerance is 90 minutes. PR time is `merged_at`. A deployment spans `created_at` to the time of its latest terminal status (`success`, `failure`, `error`, `inactive`) when that status was read; the distance is zero if the change happened during that span, otherwise the gap to the nearer end. A deployment without a terminal status is a single point at `created_at`.
 
 ### Actor
 
@@ -53,6 +53,12 @@ Matching is case-insensitive and requires non-alphanumeric boundaries around the
 
 Example: `acme-payments-logs` matches in `harden acme-payments-logs bucket` but not in `acme-payments-logs2`.
 
+#### Generic names
+
+An identifier is **generic** when every dash/underscore/dot segment is either shorter than four characters or a common word such as `app`, `prod`, `api`, `logs`, `role`, `admin`, `test` (the list is `COMMON_NAME_WORDS` in `matching.py`). Examples: `app`, `prod-api`, `dev-role`, `web-sg`. Names such as `acme-logs`, `payments-deploy`, `sg-0abc123` or any ARN are specific.
+
+A generic name appearing in the evidence is recorded (signal `generic resource name`) but does **not** count as a resource match, so a role called `app` can no longer be "matched" by a PR titled "Fix app crash". The reason reads: *actor matched, but only a generic resource name appeared in the evidence*. If a specific identifier of the same resource also appears, the match counts normally.
+
 ### State
 
 - PR evidence must be merged.
@@ -76,9 +82,18 @@ Then:
 | Candidates exist but none strong | `uncertain` |
 | No candidates in the window | `unmatched` |
 
+For `unmatched`, the reason depends on what the tool could actually check:
+
+- GitHub was queried and nothing was near: `no PR or deployment within +/-N minutes`.
+- `--repo` was not given: `GitHub evidence was not queried`, which says nothing about whether a PR exists.
+- A source (pull requests or deployments) failed to load: the reason names it and says absence is not confirmed.
+
+When a source failed but another candidate still produced `matched` or `uncertain`, a second reason notes that other candidates may exist.
+
 For `uncertain`, the reason states what was missing, for example:
 
 - actor matched, resource not found
+- actor matched, but only a generic resource name appeared
 - resource matched, actor did not match
 - time-proximate evidence only
 - deployment did not succeed
@@ -103,4 +118,5 @@ For `uncertain`, the reason states what was missing, for example:
 - A PR body may mention a resource it does not actually change. The tool correlates evidence; it does not diff the deployed result.
 - A CI role shared by many humans makes actor matching weak unless an alias or resource name disambiguates it.
 - Deployments without readable commit messages or with unavailable statuses remain `uncertain`.
-- Very busy repositories may exceed the GitHub page cap, so some evidence may be missing. Narrow the window.
+- Very busy repositories may exceed the GitHub page cap, so some evidence may be missing; the report warns when this happens. Narrow the window.
+- A resource with a mid-length single-word name that is not in the common-word list (for example `payments`) is treated as specific even though it may be common in your repository. Use `--actor-map` and a narrower window, or rename generic resources.

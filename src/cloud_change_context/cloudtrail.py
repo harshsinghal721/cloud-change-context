@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from . import __version__
 from .models import Change
 
 
@@ -71,7 +73,49 @@ _HANDLERS = {
     "ec2.amazonaws.com": EC2_EVENTS,
 }
 
+# IAM is global; its events are recorded in one fixed region per partition.
+_IAM_REGIONS = {
+    "aws": "us-east-1",
+    "aws-cn": "cn-north-1",
+    "aws-us-gov": "us-gov-west-1",
+}
+
 _ARN_NOISE = {"arn", "aws", "sts", "iam", "assumed-role", "user", "role", "federated-user"}
+
+_IAM_TEMPLATES = {
+    "PutRolePolicy": 'Created or updated inline policy "{policy_name}" on role {role}',
+    "PutUserPolicy": 'Created or updated inline policy "{policy_name}" on user {user}',
+    "PutGroupPolicy": 'Created or updated inline policy "{policy_name}" on group {group}',
+    "DeleteRolePolicy": 'Deleted inline policy "{policy_name}" from role {role}',
+    "DeleteUserPolicy": 'Deleted inline policy "{policy_name}" from user {user}',
+    "DeleteGroupPolicy": 'Deleted inline policy "{policy_name}" from group {group}',
+    "AttachRolePolicy": "Attached managed policy {policy_label} to role {role}",
+    "DetachRolePolicy": "Detached managed policy {policy_label} from role {role}",
+    "AttachUserPolicy": "Attached managed policy {policy_label} to user {user}",
+    "DetachUserPolicy": "Detached managed policy {policy_label} from user {user}",
+    "AttachGroupPolicy": "Attached managed policy {policy_label} to group {group}",
+    "DetachGroupPolicy": "Detached managed policy {policy_label} from group {group}",
+    "CreatePolicy": 'Created managed policy "{policy_name}"',
+    "DeletePolicy": "Deleted managed policy {policy_label}",
+    "CreatePolicyVersion": "Created a new version of policy {policy_label}",
+    "DeletePolicyVersion": "Deleted version {version_id} of policy {policy_label}",
+    "SetDefaultPolicyVersion": "Set default version of policy {policy_label} to {version_id}",
+    "UpdateAssumeRolePolicy": "Updated the trust policy for role {role}",
+    "PutRolePermissionsBoundary": "Set permissions boundary {boundary} on role {role}",
+    "DeleteRolePermissionsBoundary": "Removed the permissions boundary from role {role}",
+    "PutUserPermissionsBoundary": "Set permissions boundary {boundary} on user {user}",
+    "DeleteUserPermissionsBoundary": "Removed the permissions boundary from user {user}",
+}
+
+
+def partition_for(region: str | None) -> str:
+    """Map a region name to its AWS partition (used to build correct ARNs)."""
+    name = (region or "").lower()
+    if name.startswith("cn-"):
+        return "aws-cn"
+    if name.startswith("us-gov-"):
+        return "aws-us-gov"
+    return "aws"
 
 
 def parse_event(raw: dict[str, Any]) -> Change | None:
@@ -91,17 +135,20 @@ def parse_event(raw: dict[str, Any]) -> Change | None:
         or None
     )
     region = _str(raw.get("awsRegion")) or None
+    partition = partition_for(region)
     actor, actor_ids = _identity(identity)
     params = _dict(raw.get("requestParameters"))
     response = _dict(raw.get("responseElements"))
 
     if source == "iam.amazonaws.com":
-        resource, resource_ids, summary = _iam_event(name, params, response, account)
+        resource, resource_ids, summary = _iam_event(
+            name, params, response, account, partition
+        )
     elif source == "s3.amazonaws.com":
-        resource, resource_ids, summary = _s3_event(name, params)
+        resource, resource_ids, summary = _s3_event(name, params, partition)
     else:
         resource, resource_ids, summary = _security_group_event(
-            name, params, response, account, region
+            name, params, response, account, region, partition
         )
 
     resource_values = list(resource_ids)
@@ -123,10 +170,26 @@ def parse_event(raw: dict[str, Any]) -> Change | None:
     )
 
 
+def plan_queries(regions: Sequence[str]) -> list[tuple[str, str]]:
+    """The (region, event name) lookups needed to cover every tracked event.
+
+    Looking events up by name keeps CloudTrail from returning every read-only call
+    (``GetRole``, ``DescribeInstances``, ...) just to have them thrown away.
+    """
+    queries: list[tuple[str, str]] = []
+    for partition in dict.fromkeys(partition_for(region) for region in regions):
+        iam_region = _IAM_REGIONS.get(partition, "us-east-1")
+        queries.extend((iam_region, name) for name in sorted(IAM_EVENTS))
+    for region in regions:
+        queries.extend((region, name) for name in sorted(EC2_EVENTS))
+        queries.extend((region, name) for name in sorted(S3_EVENTS))
+    return list(dict.fromkeys(queries))
+
+
 def fetch_changes(
     start: datetime,
     end: datetime,
-    region: str,
+    region: str | Sequence[str],
     profile: str | None = None,
     max_events: int = 2000,
 ) -> tuple[list[Change], list[str]]:
@@ -140,29 +203,39 @@ def fetch_changes(
             "boto3 is required. Install with: pip install cloud-change-context"
         ) from None
 
-    queries = [("us-east-1", "iam.amazonaws.com")]
-    queries.append((region, "ec2.amazonaws.com"))
-    queries.append((region, "s3.amazonaws.com"))
+    regions = _regions(region)
+    queries = plan_queries(regions)
 
     changes: list[Change] = []
+    seen_ids: set[str] = set()
     warnings: list[str] = []
     parse_errors = 0
+
+    def finish() -> tuple[list[Change], list[str]]:
+        if parse_errors:
+            warnings.append(f"Skipped {parse_errors} malformed CloudTrail event(s).")
+        return sorted(changes, key=lambda change: change.time), warnings
 
     try:
         session = boto3.Session(profile_name=profile) if profile else boto3.Session()
         config = Config(
-            retries={"max_attempts": 3, "mode": "standard"},
-            user_agent_extra="cloud-change-context/0.1.0",
+            retries={"max_attempts": 5, "mode": "standard"},
+            user_agent_extra=f"cloud-change-context/{__version__}",
         )
-        for query_region, source in queries:
-            client = session.client("cloudtrail", region_name=query_region, config=config)
+        clients: dict[str, Any] = {}
+        for done, (query_region, event_name) in enumerate(queries):
+            if query_region not in clients:
+                clients[query_region] = session.client(
+                    "cloudtrail", region_name=query_region, config=config
+                )
+            client = clients[query_region]
             token: str | None = None
             while True:
                 kwargs: dict[str, Any] = {
                     "StartTime": start,
                     "EndTime": end,
                     "LookupAttributes": [
-                        {"AttributeKey": "EventSource", "AttributeValue": source}
+                        {"AttributeKey": "EventName", "AttributeValue": event_name}
                     ],
                     "MaxResults": 50,
                 }
@@ -185,12 +258,18 @@ def fetch_changes(
                         continue
                     if change is None:
                         continue
+                    if change.event_id != "unknown-event":
+                        if change.event_id in seen_ids:
+                            continue
+                        seen_ids.add(change.event_id)
                     if len(changes) >= max_events:
+                        remaining = len(queries) - done - 1
                         warnings.append(
-                            f"CloudTrail event cap ({max_events}) reached; "
-                            "the report is incomplete."
+                            f"CloudTrail event cap ({max_events}) reached while reading "
+                            f"{event_name} in {query_region}; {remaining} later lookup(s) "
+                            "were not run, so the report is incomplete."
                         )
-                        return sorted(changes, key=lambda c: c.time), warnings
+                        return finish()
                     changes.append(change)
 
                 token = response.get("NextToken")
@@ -203,14 +282,23 @@ def fetch_changes(
     except Exception as exc:  # credential/config errors from session setup
         raise CloudTrailError(f"CloudTrail query failed: {exc}") from None
 
-    if parse_errors:
-        warnings.append(f"Skipped {parse_errors} malformed CloudTrail event(s).")
+    return finish()
 
-    return sorted(changes, key=lambda c: c.time), warnings
+
+def _regions(region: str | Sequence[str]) -> list[str]:
+    values = [region] if isinstance(region, str) else list(region)
+    regions = list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
+    if not regions:
+        raise CloudTrailError("At least one AWS region is required.")
+    return regions
 
 
 def _iam_event(
-    name: str, params: dict[str, Any], response: dict[str, Any], account: str | None
+    name: str,
+    params: dict[str, Any],
+    response: dict[str, Any],
+    account: str | None,
+    partition: str = "aws",
 ) -> tuple[str, list[str], str]:
     role = _str(params.get("roleName"))
     user = _str(params.get("userName"))
@@ -241,70 +329,35 @@ def _iam_event(
         resource = "unknown IAM resource"
 
     target = role or user or group or policy_arn or policy_name or "unknown target"
-    policy_label = policy_arn or policy_name or "unknown policy"
-
-    if name == "PutRolePolicy":
-        summary = f'Created or updated inline policy "{policy_name or "unknown"}" on role {role}'
-    elif name == "PutUserPolicy":
-        summary = f'Created or updated inline policy "{policy_name or "unknown"}" on user {user}'
-    elif name == "PutGroupPolicy":
-        summary = f'Created or updated inline policy "{policy_name or "unknown"}" on group {group}'
-    elif name == "DeleteRolePolicy":
-        summary = f'Deleted inline policy "{policy_name or "unknown"}" from role {role}'
-    elif name == "DeleteUserPolicy":
-        summary = f'Deleted inline policy "{policy_name or "unknown"}" from user {user}'
-    elif name == "DeleteGroupPolicy":
-        summary = f'Deleted inline policy "{policy_name or "unknown"}" from group {group}'
-    elif name == "AttachRolePolicy":
-        summary = f"Attached managed policy {policy_label} to role {role}"
-    elif name == "DetachRolePolicy":
-        summary = f"Detached managed policy {policy_label} from role {role}"
-    elif name == "AttachUserPolicy":
-        summary = f"Attached managed policy {policy_label} to user {user}"
-    elif name == "DetachUserPolicy":
-        summary = f"Detached managed policy {policy_label} from user {user}"
-    elif name == "AttachGroupPolicy":
-        summary = f"Attached managed policy {policy_label} to group {group}"
-    elif name == "DetachGroupPolicy":
-        summary = f"Detached managed policy {policy_label} from group {group}"
-    elif name == "CreatePolicy":
-        summary = f'Created managed policy "{policy_name or "unknown"}"'
-    elif name == "DeletePolicy":
-        summary = f"Deleted managed policy {policy_label}"
-    elif name == "CreatePolicyVersion":
-        summary = f"Created a new version of policy {policy_label}"
-        if params.get("setAsDefault") is True:
-            summary += " and set it as the default"
-    elif name == "DeletePolicyVersion":
-        summary = f"Deleted version {version_id or 'unknown'} of policy {policy_label}"
-    elif name == "SetDefaultPolicyVersion":
-        summary = f"Set default version of policy {policy_label} to {version_id or 'unknown'}"
-    elif name == "UpdateAssumeRolePolicy":
-        summary = f"Updated the trust policy for role {role or 'unknown'}"
-    elif name == "PutRolePermissionsBoundary":
-        summary = f"Set permissions boundary {boundary or 'unknown'} on role {role}"
-    elif name == "DeleteRolePermissionsBoundary":
-        summary = f"Removed the permissions boundary from role {role}"
-    elif name == "PutUserPermissionsBoundary":
-        summary = f"Set permissions boundary {boundary or 'unknown'} on user {user}"
-    elif name == "DeleteUserPermissionsBoundary":
-        summary = f"Removed the permissions boundary from user {user}"
-    else:
+    template = _IAM_TEMPLATES.get(name)
+    if template is None:
         summary = f"{name} on {target}"
+    else:
+        summary = template.format(
+            role=role or "unknown",
+            user=user or "unknown",
+            group=group or "unknown",
+            policy_name=policy_name or "unknown",
+            policy_label=policy_arn or policy_name or "unknown policy",
+            boundary=boundary or "unknown",
+            version_id=version_id or "unknown",
+        )
+    if name == "CreatePolicyVersion" and str(params.get("setAsDefault")).lower() == "true":
+        summary += " and set it as the default"
 
     identifiers = [role, user, group, policy_name, policy_arn, boundary]
     if account and role:
-        identifiers.append(f"arn:aws:iam::{account}:role/{role}")
+        identifiers.append(f"arn:{partition}:iam::{account}:role/{role}")
     if account and user:
-        identifiers.append(f"arn:aws:iam::{account}:user/{user}")
+        identifiers.append(f"arn:{partition}:iam::{account}:user/{user}")
     return resource, identifiers, summary
 
 
 def _s3_event(
-    name: str, params: dict[str, Any]
+    name: str, params: dict[str, Any], partition: str = "aws"
 ) -> tuple[str, list[str], str]:
     bucket = _str(params.get("bucketName")) or "unknown-bucket"
-    arn = f"arn:aws:s3:::{bucket}"
+    arn = f"arn:{partition}:s3:::{bucket}"
 
     if name == "PutBucketPolicy":
         summary = "Set a bucket policy (review for public principals)"
@@ -338,9 +391,15 @@ def _security_group_event(
     response: dict[str, Any],
     account: str | None,
     region: str | None,
+    partition: str = "aws",
 ) -> tuple[str, list[str], str]:
     group = _dict(response.get("securityGroup"))
-    group_id = _str(params.get("groupId")) or _str(group.get("groupId"))
+    group_id = (
+        _str(params.get("groupId"))
+        or _str(response.get("groupId"))  # CreateSecurityGroup answers at the top level
+        or _str(group.get("groupId"))
+        or _deep_str(params, "groupid")  # ModifySecurityGroupRules nests it in its request
+    )
     group_name = _str(params.get("groupName")) or _str(group.get("groupName"))
 
     if group_id:
@@ -366,57 +425,131 @@ def _security_group_event(
         ),
     }
     summary = labels.get(name, f"{name} on {resource}")
-    details = _rule_details(params)
+    if name == "ModifySecurityGroupRules":
+        details = _modified_rule_details(params)
+    else:
+        details = _rule_details(params)
     if details:
         summary = f"{summary}: {details}"
 
     identifiers = [group_id, group_name]
     if account and region and group_id:
-        identifiers.append(f"arn:aws:ec2:{region}:{account}:security-group/{group_id}")
+        identifiers.append(
+            f"arn:{partition}:ec2:{region}:{account}:security-group/{group_id}"
+        )
     return resource, identifiers, summary
 
 
+_MAX_RULES_SHOWN = 3
+
+
+def _port_label(protocol: str, from_port: Any, to_port: Any) -> str:
+    if protocol in ("-1", "all"):
+        return "all"
+    if from_port is None and to_port is None:
+        return ""
+    if from_port == to_port:
+        return str(from_port)
+    start_port = from_port if from_port is not None else "*"
+    end_port = to_port if to_port is not None else "*"
+    return f"{start_port}-{end_port}"
+
+
+def _rule_label(protocol: str, port: str, sources: list[str]) -> str:
+    label = f"{protocol} {port}".strip()
+    if sources:
+        label += f" from {', '.join(dict.fromkeys(sources))}"
+    return label
+
+
 def _rule_details(params: dict[str, Any]) -> str:
-    items = _aws_list(params.get("ipPermissions"))[:3]
+    all_items = _aws_list(params.get("ipPermissions"))
     details: list[str] = []
-    for item in items:
+    for item in all_items[:_MAX_RULES_SHOWN]:
         permission = _dict(item)
         protocol = _str(permission.get("ipProtocol")) or "?"
-        from_port = permission.get("fromPort")
-        to_port = permission.get("toPort")
-        if protocol in ("-1", "all"):
-            port = "all"
-        elif from_port is None and to_port is None:
-            port = ""
-        elif from_port == to_port:
-            port = str(from_port)
-        else:
-            start_port = from_port if from_port is not None else "*"
-            end_port = to_port if to_port is not None else "*"
-            port = f"{start_port}-{end_port}"
+        port = _port_label(protocol, permission.get("fromPort"), permission.get("toPort"))
 
         sources: list[str] = []
+        # CloudTrail names the security-group sources "groups"; "userIdGroupPairs" is the
+        # SDK name. The account id (userId) is not a source, so it is not listed.
         for key, field in (
             ("ipRanges", "cidrIp"),
             ("ipv6Ranges", "cidrIpv6"),
             ("prefixListIds", "prefixListId"),
+            ("groups", "groupId"),
             ("userIdGroupPairs", "groupId"),
-            ("userIdGroupPairs", "userId"),
         ):
             for source in _aws_list(permission.get(key)):
                 value = _str(_dict(source).get(field))
                 if value:
                     sources.append(value)
+        details.append(_rule_label(protocol, port, sources))
 
-        label = f"{protocol} {port}".strip()
-        if sources:
-            label += f" from {', '.join(dict.fromkeys(sources))}"
-        details.append(label)
-
-    all_items = _aws_list(params.get("ipPermissions"))
-    if len(all_items) > 3:
-        details.append(f"+{len(all_items) - 3} more rule(s)")
+    if len(all_items) > _MAX_RULES_SHOWN:
+        details.append(f"+{len(all_items) - _MAX_RULES_SHOWN} more rule(s)")
     return "; ".join(details)
+
+
+def _modified_rule_details(params: dict[str, Any]) -> str:
+    """Summarize ModifySecurityGroupRules, whose rules sit in a nested request object.
+
+    The nesting and key casing are matched loosely (case-insensitive, any depth) so a
+    layout change in CloudTrail degrades to a shorter summary instead of an error.
+    """
+    rules = [rule for rule in _walk_dicts(params) if "ipprotocol" in _lower_keys(rule)]
+    details: list[str] = []
+    for rule in rules[:_MAX_RULES_SHOWN]:
+        fields = _lower_keys(rule)
+        protocol = _str(fields.get("ipprotocol")) or "?"
+        port = _port_label(protocol, fields.get("fromport"), fields.get("toport"))
+        sources: list[str] = []
+        for key in ("cidripv4", "cidripv6", "prefixlistid"):
+            value = _str(fields.get(key))
+            if value:
+                sources.append(value)
+        referenced = fields.get("referencedgroupid")
+        referenced_id = (
+            _str(referenced)
+            if isinstance(referenced, str)
+            else _str(_lower_keys(_dict(referenced)).get("groupid"))
+        )
+        if referenced_id:
+            sources.append(referenced_id)
+        details.append(_rule_label(protocol, port, sources))
+    if len(rules) > _MAX_RULES_SHOWN:
+        details.append(f"+{len(rules) - _MAX_RULES_SHOWN} more rule(s)")
+    return "; ".join(details)
+
+
+def _walk_dicts(value: Any, depth: int = 0) -> list[dict[str, Any]]:
+    """Every dict nested inside ``value`` (shallow depth limit; CloudTrail bodies are small)."""
+    if depth > 8:
+        return []
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        found.append(value)
+        children: list[Any] = list(value.values())
+    elif isinstance(value, list):
+        children = value
+    else:
+        return found
+    for child in children:
+        found.extend(_walk_dicts(child, depth + 1))
+    return found
+
+
+def _lower_keys(value: dict[str, Any]) -> dict[str, Any]:
+    return {str(key).lower(): item for key, item in value.items()}
+
+
+def _deep_str(value: Any, key: str) -> str:
+    """First non-empty string stored under ``key`` (case-insensitive) at any depth."""
+    for found in _walk_dicts(value):
+        text = _str(_lower_keys(found).get(key))
+        if text:
+            return text
+    return ""
 
 
 def _identity(identity: dict[str, Any]) -> tuple[str, list[str]]:
